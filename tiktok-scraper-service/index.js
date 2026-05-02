@@ -52,6 +52,66 @@ function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+function summarizeSearchApiResponses(records) {
+    if (!records.length) {
+        return 'Không thấy request /api/search/general/full (XHR không chạy hoặc URL khác phiên bản web).';
+    }
+    return records
+        .map((r, i) => {
+            const parts = [`#${i + 1} HTTP ${r.status}`];
+            if (r.tiktok_status_code !== undefined) {
+                parts.push(`TikTok status_code=${r.tiktok_status_code}`);
+            }
+            if (r.dataSlots !== undefined) {
+                parts.push(`data.slots=${r.dataSlots}`);
+            }
+            if (r.parsedVideos !== undefined) {
+                parts.push(`video type-1=${r.parsedVideos}`);
+            }
+            if (r.jsonError) parts.push(`json: ${r.jsonError}`);
+            return parts.join(', ');
+        })
+        .join(' | ');
+}
+
+async function collectPageDiagnostics(page) {
+    return page.evaluate(() => {
+        const title = document.title || '';
+        const href = location.href || '';
+        const hasUni = !!document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__');
+        const hasSigi = !!document.querySelector('#SIGI_STATE');
+        let hydrationItemHint = null;
+        const el = document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__');
+        if (el) {
+            try {
+                const j = JSON.parse(el.innerText);
+                const list = j?.__DEFAULT_SCOPE__?.webapp?.search?.itemList;
+                if (Array.isArray(list)) hydrationItemHint = `itemList array length=${list.length}`;
+                else if (list && typeof list === 'object') {
+                    hydrationItemHint = `itemList object keys=${Object.keys(list).length}`;
+                } else {
+                    hydrationItemHint = 'itemList missing or empty in hydration';
+                }
+            } catch {
+                hydrationItemHint = 'hydration script present but JSON parse failed';
+            }
+        }
+        const text = (document.body?.innerText || '').slice(0, 500).toLowerCase();
+        const pageHints = [];
+        if (text.includes('captcha') || text.includes('verify')) pageHints.push('body mentions captcha/verify');
+        if (text.includes('robot')) pageHints.push('body mentions robot');
+        if (text.includes('log in') || text.includes('sign up')) pageHints.push('possible login wall');
+        return {
+            pageUrl: href.slice(0, 300),
+            title: title.slice(0, 200),
+            hasHydrationScript: hasUni,
+            hasSigiState: hasSigi,
+            hydrationSearchHint: hydrationItemHint,
+            bodyTextHints: pageHints
+        };
+    });
+}
+
 /** Fallback: đọc JSON trong <script> — không dùng waitForSelector (script có thể không có khi bị chặn). */
 async function tryHydrationVideos(page) {
     const maxWaitMs = Number(process.env.SCRAPE_HYDRATION_MS || 18000);
@@ -117,18 +177,33 @@ app.get('/scrape', async (req, res) => {
 
     try {
         const parseTasks = [];
+        /** @type {Array<{ status: number, tiktok_status_code?: number, dataSlots?: number, parsedVideos?: number, jsonError?: string }>} */
+        const searchApiResponses = [];
+
         const onSearchResponse = (response) => {
-            if (
-                !response.url().includes('/api/search/general/full') ||
-                response.status() !== 200
-            ) {
-                return;
-            }
+            if (!response.url().includes('/api/search/general/full')) return;
+            const status = response.status();
+            const rec = { status };
+            searchApiResponses.push(rec);
+            if (status !== 200) return;
+
             parseTasks.push(
                 response
                     .json()
-                    .then((j) => videosFromSearchGeneralFull(j))
-                    .catch(() => [])
+                    .then((j) => {
+                        const videos = videosFromSearchGeneralFull(j);
+                        rec.tiktok_status_code = j?.status_code;
+                        rec.dataSlots =
+                            j?.data && typeof j.data === 'object'
+                                ? Object.keys(j.data).length
+                                : 0;
+                        rec.parsedVideos = videos.length;
+                        return videos;
+                    })
+                    .catch((e) => {
+                        rec.jsonError = e.message;
+                        return [];
+                    })
             );
         };
         page.on('response', onSearchResponse);
@@ -158,18 +233,62 @@ app.get('/scrape', async (req, res) => {
             .map(mapVideo)
             .filter((v) => v.link_video);
 
+        let pageDiagnostics = null;
+        if (results.length === 0) {
+            pageDiagnostics = await collectPageDiagnostics(page);
+        }
+
         await browser.close();
 
-        res.json(
-            results.length > 0
-                ? results
-                : {
-                      message: 'No videos found',
-                      debug:
-                          'Không có dữ liệu từ API search và không đọc được JSON trong trang. ' +
-                          'TikTok thường chặn hoặc giới hạn IP máy chủ (Render, v.v.); thử proxy/residential IP hoặc tăng SCRAPE_SETTLE_MS.'
-                  }
-        );
+        if (results.length > 0) {
+            return res.json(results);
+        }
+
+        const apiSummary = summarizeSearchApiResponses(searchApiResponses);
+        const inferred =
+            searchApiResponses.length === 0
+                ? 'likely_no_xhr'
+                : searchApiResponses.every((r) => r.status !== 200)
+                  ? 'search_api_all_non_200'
+                  : searchApiResponses.some(
+                        (r) =>
+                            r.status === 200 &&
+                            r.parsedVideos === 0 &&
+                            (r.dataSlots || 0) > 0
+                    )
+                    ? 'api_has_slots_but_no_type1_videos'
+                    : searchApiResponses.some((r) => r.status === 200 && r.parsedVideos === 0)
+                      ? 'api_200_empty_parse'
+                      : 'unknown';
+
+        const inferredVi = {
+            likely_no_xhr:
+                'Không bắt được XHR search — thường do trang không load đủ, bị chặn, hoặc endpoint đổi.',
+            search_api_all_non_200:
+                'Có gọi API search nhưng toàn bộ HTTP khác 200 (từ chối / lỗi máy chủ TikTok).',
+            api_has_slots_but_no_type1_videos:
+                'API 200 và có data nhưng không có block video (type 1) — có thể chỉ user/card khác hoặc format đổi.',
+            api_200_empty_parse:
+                'API 200 nhưng parse ra 0 video (body rỗng / không khớp parser).',
+            unknown: 'Không xếp loại được — xem chi tiết searchApiResponses và page.'
+        }[inferred] || inferred;
+
+        return res.json({
+            message: 'No videos found',
+            debug: `${apiSummary} Trang: hydration=${pageDiagnostics?.hasHydrationScript ? 'có' : 'không'}, SIGI=${pageDiagnostics?.hasSigiState ? 'có' : 'không'}. Gợi ý: ${pageDiagnostics?.hydrationSearchHint || 'không đọc được itemList từ script'}.`,
+            diagnostics: {
+                settleMs,
+                searchApiCalls: searchApiResponses.length,
+                searchApiResponses,
+                page: pageDiagnostics,
+                inferredReason: inferred,
+                inferredReasonVi: inferredVi,
+                environment: {
+                    render: process.env.RENDER === 'true',
+                    node: process.version
+                }
+            }
+        });
     } catch (error) {
         await browser.close();
         res.status(500).json({
