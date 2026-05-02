@@ -48,6 +48,50 @@ function dedupeVideosById(videos) {
     return out;
 }
 
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Fallback: đọc JSON trong <script> — không dùng waitForSelector (script có thể không có khi bị chặn). */
+async function tryHydrationVideos(page) {
+    const maxWaitMs = Number(process.env.SCRAPE_HYDRATION_MS || 18000);
+    const pollMs = Number(process.env.SCRAPE_HYDRATION_POLL_MS || 2000);
+    const deadline = Date.now() + maxWaitMs;
+
+    while (Date.now() < deadline) {
+        const videos = await page.evaluate(() => {
+            const script =
+                document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__') ||
+                document.querySelector('#SIGI_STATE');
+
+            if (!script) return [];
+
+            let json;
+            try {
+                json = JSON.parse(script.innerText);
+            } catch {
+                return [];
+            }
+
+            const items =
+                json?.__DEFAULT_SCOPE__?.webapp?.search?.itemList ||
+                json?.ItemModule ||
+                {};
+
+            if (Array.isArray(items)) return items;
+            if (typeof items === 'object' && items !== null) {
+                return Object.values(items);
+            }
+            return [];
+        });
+
+        if (videos.length > 0) return videos;
+        await sleep(pollMs);
+    }
+
+    return [];
+}
+
 app.get('/scrape', async (req, res) => {
     const keyword = req.query.keyword;
     if (keyword == null || String(keyword).trim() === '') {
@@ -56,7 +100,12 @@ app.get('/scrape', async (req, res) => {
 
     const browser = await chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            // Tránh crash / chậm trên Docker (Render, v.v.)
+            '--disable-dev-shm-usage'
+        ]
     });
 
     const context = await browser.newContext({
@@ -89,45 +138,19 @@ app.get('/scrape', async (req, res) => {
             { waitUntil: 'domcontentloaded', timeout: 60000 }
         );
 
-        // Search XHR often fires right after load; give time for handlers + JSON bodies
-        await new Promise((r) => setTimeout(r, 8000));
+        // Trên Render (CPU chậm / mạng): chờ XHR lâu hơn — chỉnh SCRAPE_SETTLE_MS
+        const settleMs = Number(
+            process.env.SCRAPE_SETTLE_MS ||
+                (process.env.RENDER === 'true' ? 15000 : 8000)
+        );
+        await sleep(settleMs);
         page.off('response', onSearchResponse);
 
         const batches = await Promise.all(parseTasks);
         let rawVideos = dedupeVideosById(batches.flat());
 
         if (rawVideos.length === 0) {
-            await page.waitForSelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__, #SIGI_STATE', {
-                state: 'attached',
-                timeout: 15000
-            });
-
-            rawVideos = await page.evaluate(() => {
-                const script =
-                    document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__') ||
-                    document.querySelector('#SIGI_STATE');
-
-                if (!script) return [];
-
-                let json;
-                try {
-                    json = JSON.parse(script.innerText);
-                } catch {
-                    return [];
-                }
-
-                const items =
-                    json?.__DEFAULT_SCOPE__?.webapp?.search?.itemList ||
-                    json?.ItemModule ||
-                    {};
-
-                let videos = [];
-                if (Array.isArray(items)) videos = items;
-                else if (typeof items === 'object' && items !== null) {
-                    videos = Object.values(items);
-                }
-                return videos;
-            });
+            rawVideos = await tryHydrationVideos(page);
         }
 
         const results = rawVideos
@@ -140,13 +163,18 @@ app.get('/scrape', async (req, res) => {
         res.json(
             results.length > 0
                 ? results
-                : { message: 'No videos found', debug: 'JSON not found or empty' }
+                : {
+                      message: 'No videos found',
+                      debug:
+                          'Không có dữ liệu từ API search và không đọc được JSON trong trang. ' +
+                          'TikTok thường chặn hoặc giới hạn IP máy chủ (Render, v.v.); thử proxy/residential IP hoặc tăng SCRAPE_SETTLE_MS.'
+                  }
         );
     } catch (error) {
         await browser.close();
         res.status(500).json({
             error: error.message,
-            debug: 'Failed to scrape JSON'
+            debug: 'Failed to scrape (Playwright / mạng / timeout)'
         });
     }
 });
