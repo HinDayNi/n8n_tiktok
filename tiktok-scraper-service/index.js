@@ -16,11 +16,15 @@ app.get('/scrape', async (req, res) => {
     const page = await context.newPage();
     
     try {
-        await page.goto(`https://www.tiktok.com/search?q=${encodeURIComponent(keyword)}`, { waitUntil: 'networkidle' });
+        // Sử dụng domcontentloaded thay vì networkidle để tránh timeout
+        await page.goto(`https://www.tiktok.com/search?q=${encodeURIComponent(keyword)}`, { 
+            waitUntil: 'domcontentloaded',
+            timeout: 15000 
+        }).catch(err => console.log('Navigation warning:', err.message));
         
-        // Chờ video items load
-        await page.waitForSelector('div[class*="search-result"]', { timeout: 10000 }).catch(() => null);
-        await page.waitForTimeout(2000);
+        // Chờ video items load với timeout ngắn hơn
+        await page.waitForSelector('div[class*="search-result"]', { timeout: 5000 }).catch(() => null);
+        await page.waitForTimeout(1500);
 
         // Logic trích xuất dữ liệu từ các thẻ HTML của TikTok
         const results = await page.evaluate(() => {
