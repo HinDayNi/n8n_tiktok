@@ -1,5 +1,5 @@
 # Sử dụng image chính thức của Playwright (đã có sẵn Node.js và các trình duyệt)
-FROM mcr.microsoft.com/playwright:v1.43.0-jammy
+FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 
 # Tạo thư mục làm việc trong container
 WORKDIR /app
