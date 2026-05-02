@@ -28,39 +28,56 @@ app.get('/scrape', async (req, res) => {
 
         // Logic trích xuất dữ liệu từ các thẻ HTML của TikTok
         const results = await page.evaluate(() => {
-            // Thử nhiều selectors khác nhau
-            let items = Array.from(document.querySelectorAll('[data-e2e="search_video-item"]'));
+            // Lấy tất cả video items từ TikTok
+            let items = [];
             
+            // Selector 1: Data attribute
+            items = Array.from(document.querySelectorAll('[data-e2e="search_video-item"]'));
+            
+            // Selector 2: Common TikTok video container
             if (items.length === 0) {
-                items = Array.from(document.querySelectorAll('div[class*="search-result"]'));
+                items = Array.from(document.querySelectorAll('div[class*="feed-item"]'));
             }
             
+            // Selector 3: Video link containers
             if (items.length === 0) {
-                items = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+                items = Array.from(document.querySelectorAll('a[href*="/video/"]')).map(a => a.closest('div[class*="container"]') || a.parentElement);
+            }
+            
+            // Selector 4: Fallback to any strong tags within divs
+            if (items.length === 0) {
+                items = Array.from(document.querySelectorAll('div')).filter(div => {
+                    return div.querySelector('a[href*="/video/"]') && div.querySelectorAll('strong').length > 0;
+                });
             }
             
             return items.slice(0, 5).map(item => {
-                const link = item.querySelector('a')?.href || item.href || '';
+                // Lấy link video
+                const linkEl = item.querySelector('a[href*="/video/"]') || item.querySelector('a');
+                const link = linkEl?.href || '';
                 
-                // Lấy view
-                const viewElement = item.querySelector('[data-e2e="video-views"]') || 
-                                   item.querySelector('span[class*="view"]') ||
-                                   item.querySelector('strong');
+                // Lấy tất cả strong elements (thường là view và like)
+                const stats = Array.from(item.querySelectorAll('strong'));
                 
-                // Lấy like
-                const likeElement = item.querySelector('[data-e2e="video-likes"]') || 
-                                   item.querySelector('span[class*="like"]') ||
-                                   item.querySelector('[class*="favorite"]');
+                let view = 'Unknown';
+                let like = 'Unknown';
+                
+                if (stats.length >= 2) {
+                    view = stats[0].innerText;  // View thường đầu tiên
+                    like = stats[1].innerText;  // Like thường thứ hai
+                } else if (stats.length === 1) {
+                    view = stats[0].innerText;
+                }
                 
                 // Lấy description
                 const descElement = item.querySelector('[data-e2e="search_video-desc"]') || 
                                    item.querySelector('p') || 
-                                   item.querySelector('span[class*="desc"]');
+                                   item.querySelector('span');
                 
                 return {
                     link_video: link,
-                    like: viewElement?.innerText || 'Unknown',
-                    view: likeElement?.innerText || 'Unknown',
+                    like: view,
+                    view: like,
                     desc: descElement?.innerText || 'No description'
                 };
             }).filter(item => item.link_video); // Chỉ giữ items có link
