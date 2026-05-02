@@ -5,7 +5,7 @@ const app = express();
 // Function to create a new browser context with anti-detection measures
 async function createBrowser() {
     return await chromium.launch({
-        headless: 'new',
+        headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
